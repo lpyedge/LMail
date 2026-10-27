@@ -14,9 +14,9 @@ same `mailtest.config.yaml` and prints the same messages:
 | `mailtest.ps1` | Windows PowerShell 5.1, PowerShell 7+ | nothing to install |
 
 Each file is self-contained: copy one anywhere. On the first run it creates `mailtest.config.yaml` **next to
-itself** from a template it carries, prints where it put it, and stops (exit code 2) without sending. The
-config is never overwritten, is git-ignored, and is loaded from the script's directory regardless of the
-current directory.
+itself** from a template it carries, prints where it put it, and carries on, so a fresh copy is usable at
+once. The config is never overwritten, is git-ignored, and is loaded from the script's directory regardless of
+the current directory.
 
 They are connectivity and credential checks, not a bulk mailer. To send from your application use the `LMail`
 library itself ([README](../README.md)).
@@ -46,7 +46,7 @@ or go straight to an entry:
 | Use another config file | `--config PATH` | `-ConfigPath PATH` |
 
 ```bash
-./mailtest.sh                              # first run: creates mailtest.config.yaml, exit 2
+./mailtest.sh                              # first run: creates mailtest.config.yaml, then the menu
 $EDITOR mailtest.config.yaml               # message.from / message.to and the profile you want
 export SMTP_PASSWORD='app-password'
 ./mailtest.sh --validate-only
@@ -54,7 +54,8 @@ export SMTP_PASSWORD='app-password'
 ```
 
 Exit codes: **0** accepted (or validation passed), **1** configuration, connection, authentication or API
-error, **2** the config file was just created. "Accepted" means the server or API took the message; it does not
+error. Sending with the untouched template (both `message.from` and `message.to` still the placeholders) is
+refused with a pointer to the config file. "Accepted" means the server or API took the message; it does not
 prove inbox delivery. If PowerShell's execution policy blocks the script, follow your organisation's policy,
 for example `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailtest.ps1` for that one process.
 
@@ -102,7 +103,7 @@ The `oauth2` block of an OAuth profile:
 | `grant` | `refresh_token` (sign in once, reuse the token), `client_credentials` (Microsoft application identity) or `access_token` |
 | `client_id`, `client_secret` | from the provider's app registration; omit the secret for a public client |
 | `refresh_token` | `env:NAME` with the token you get from the authorize entry |
-| `tenant` | Microsoft only: `organizations`, a tenant GUID or a domain |
+| `tenant` | Microsoft only: `common` (default; work, school and personal accounts), `organizations` (work or school only), `consumers` (personal only), or a tenant GUID / domain |
 | `scope` | override the default scope |
 | `flow` | Microsoft only: `loopback` (default) or `device_code` |
 | `redirect_port` | fixed port for the local web server (default: a free port) |
@@ -123,8 +124,11 @@ Resend has no SMTP profile here; use it through `LMail` (`ResendEmailSender`).
 
 ## Getting an OAuth2 token
 
-1. Register an application with the provider (below), put its `client_id` (and secret) into the profile.
-   The tool refuses the template's placeholder ids.
+1. Register an application with the provider (below). Put its `client_id` (and secret) into the profile, or
+   skip that: when the profile still has the template `client_id`, the authorize entry asks for it in the
+   terminal (and for the client secret, hidden, and for a generic provider the endpoints and scope). Nothing
+   typed there is saved; add the values to the YAML to reuse them. Without a terminal it stops and tells you
+   to edit the file.
 2. Start the authorize entry (`2` in the menu, or `--init-oauth` / `-InitOAuth`) and choose the provider.
 3. The tool prints an **authorization URL**. It never opens a browser: open the URL yourself, sign in and
    approve.
@@ -148,19 +152,38 @@ local browser, or let the tool fall back: when it cannot listen (no `python3`, p
 paste the address-bar URL (or just its `code=` value) after approving. Microsoft profiles can also use
 `flow: device_code`, which needs no redirect at all.
 
-### Microsoft 365
+### Microsoft (Microsoft 365, Outlook.com, Graph)
 
-1. [Register an application](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)
-   in Microsoft Entra ID and note the **Application (client) ID** and the tenant.
-2. Under *Authentication* add the platform **Mobile and desktop applications** with the redirect URI
-   `http://localhost` (any port is accepted for it). For `flow: device_code` allow **public client flows**
-   instead.
-3. Under *API permissions* add the **delegated** permission `SMTP.Send` of *Office 365 Exchange Online* (for
-   Graph: `Mail.Send` of Microsoft Graph) and consent as your organisation requires.
-4. Allow SMTP AUTH for the mailbox
+Sign in as a user (`microsoft_user` for SMTP, `microsoft_graph_user` for Graph):
+
+1. In the [Microsoft Entra admin center](https://entra.microsoft.com) open *App registrations > New
+   registration*
+   ([guide](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)).
+2. Choose the **supported account types** and use the matching `tenant:` in the profile:
+
+   | Account type to choose | `tenant:` | Who can sign in |
+   | --- | --- | --- |
+   | Any organizational directory **and personal Microsoft accounts** | `common` (default) | work, school and personal accounts |
+   | Any organizational directory | `organizations` | work or school accounts |
+   | Personal Microsoft accounts only | `consumers` | personal accounts |
+   | This organizational directory only | tenant GUID or domain | one company |
+
+3. **Callback / redirect URI**: platform *Public client/native (mobile & desktop)*, value
+   `http://localhost`. Loopback addresses accept any port, so the random port the tool picks needs no extra
+   registration. (Later: *Authentication > Add a platform > Mobile and desktop applications*.)
+4. Copy **Application (client) ID** from *Overview* into `client_id`. A public client has no secret.
+5. *API permissions > Add a permission*: for Graph **Microsoft Graph > Delegated > Mail.Send**; for SMTP
+   **Office 365 Exchange Online > Delegated > SMTP.Send** (under *APIs my organization uses*). Consent as your
+   organisation requires.
+6. SMTP on a work or school mailbox also needs SMTP AUTH allowed for it
    ([enable or disable SMTP AUTH](https://learn.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/authenticated-client-smtp-submission)).
-5. Fill `client_id` and `tenant` into `microsoft_user` (SMTP) or `microsoft_graph_user` (Graph) and authorize.
-   SMTP and Graph tokens are separate because their scopes differ.
+   For a personal Outlook.com mailbox use host `smtp-mail.outlook.com`.
+7. Run the authorize entry, choose the profile, open the URL, sign in, export the printed token
+   (`MS_SMTP_REFRESH_TOKEN` or `MS_GRAPH_REFRESH_TOKEN`). SMTP and Graph tokens are separate because their
+   scopes differ.
+
+For `flow: device_code` (no browser on the machine) allow **public client flows** under *Authentication*; no
+redirect URI is used.
 
 The default scopes are `https://outlook.office.com/SMTP.Send offline_access` (SMTP) and
 `https://graph.microsoft.com/Mail.Send offline_access` (Graph), as documented in
@@ -168,33 +191,47 @@ The default scopes are `https://outlook.office.com/SMTP.Send offline_access` (SM
 set `scope` to override. The device code flow is described in
 [OAuth 2.0 device authorization grant](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
 
-For an **application identity** (`microsoft_app`, `microsoft_graph_app`; no sign-in, so no token to fetch) use
-`grant: client_credentials` with a tenant id and `client_secret: env:NAME`. SMTP needs the `SMTP.SendAsApp`
-application permission, admin consent and an Exchange service principal with mailbox permission (same
-Microsoft page, section *Use client credentials grant flow*). Graph needs the `Mail.Send` application
-permission and a `mailbox` equal to `message.from`
-([sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail)). Restrict the application to the
-mailboxes it needs.
+**Application identity** (`microsoft_app`, `microsoft_graph_app`; work or school tenants only): no user signs in,
+so there is **no callback / redirect URI** and no token to fetch; the tool exchanges the client id and secret
+for an access token on every run.
+
+1. *New registration*, account type *This organizational directory only*; leave the redirect URI empty.
+2. From *Overview* copy **Application (client) ID** -> `client_id` and **Directory (tenant) ID** -> `tenant`
+   (a GUID or domain, never `common`, `organizations` or `consumers`).
+3. *Certificates & secrets > New client secret*: copy the secret **Value** (shown once) into the variable named
+   by `client_secret: env:NAME`.
+4. *API permissions > Add a permission > Application permissions*, then *Grant admin consent*: for Graph
+   **Microsoft Graph > Mail.Send** (the `mailbox` must equal `message.from`,
+   [sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail)); for SMTP **Office 365 Exchange
+   Online > SMTP.SendAsApp** plus an Exchange service principal and mailbox permission (Microsoft page above,
+   section *Use client credentials grant flow*).
+5. `Mail.Send` as an application permission can send as **any** mailbox: restrict it to the mailboxes you need
+   with an Exchange Application Access Policy.
 
 ### Gmail
 
-1. In the [Google Cloud console](https://console.cloud.google.com/apis/credentials) configure the OAuth
-   consent screen and create an **OAuth client ID of type "Desktop app"**. Note the client id and secret.
-2. Put them into `gmail_oauth` (`client_id`, `client_secret: env:GOOGLE_CLIENT_SECRET`), export the secret and
-   authorize. The scope is `https://mail.google.com/`
-   ([Gmail OAuth 2.0 mechanism](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)); the
-   sign-in is the authorization code flow with PKCE and a loopback redirect
-   ([OAuth 2.0 for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
-
-Google refresh tokens expire after a short time while the consent screen is in *Testing* status; publish the
-app (or use an internal app) for a longer-lived token.
+1. In the [Google Cloud console](https://console.cloud.google.com/apis/credentials) create or select a project.
+2. Configure the *OAuth consent screen* (*Google Auth Platform*): *External*, or *Internal* for a Google
+   Workspace organisation. While the app is in *Testing* status add your account under *Test users*; refresh
+   tokens then expire after 7 days. Publish the app for longer-lived tokens.
+3. *Credentials > Create credentials > OAuth client ID*, application type **Desktop app**. Copy the client id
+   into `client_id` and the client secret into the variable named by `client_secret: env:NAME`.
+4. **Callback / redirect URI**: nothing to register for a Desktop app client; it accepts `http://localhost` and
+   `http://127.0.0.1` on any port. With a *Web application* client instead, add `http://localhost:PORT` under
+   *Authorized redirect URIs* and set `redirect_port: PORT` in the profile.
+5. Run the authorize entry, choose `gmail_oauth`, open the URL and approve access to `https://mail.google.com/`
+   ([Gmail OAuth 2.0 mechanism](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol); the
+   sign-in is the authorization code flow with PKCE and a loopback redirect,
+   [OAuth 2.0 for desktop apps](https://developers.google.com/identity/protocols/oauth2/native-app)). Export the
+   printed token as `GOOGLE_REFRESH_TOKEN`.
 
 ### Any other OAuth2 provider
 
-Use `generic_oauth`: set `authorize_url`, `token_url`, `scope`, `client_id` (and `client_secret` for a
-confidential client) from the provider's documentation. Register `http://localhost` as the redirect URI, or
-register the exact port you set in `redirect_port` if the provider matches ports. The provider must support
-the authorization code flow and return a refresh token.
+Use `generic_oauth`: take `authorize_url`, `token_url` and `scope` (include the scope that yields a refresh
+token, often `offline_access`) from the provider's developer documentation, and `client_id` (plus
+`client_secret` for a confidential client) from the app you register there. **Callback / redirect URI:**
+register `http://localhost`; if the provider requires an exact URI, register `http://localhost:8765` and set
+`redirect_port: 8765`. The provider must support the authorization code flow and return a refresh token.
 
 ### Cloudflare
 

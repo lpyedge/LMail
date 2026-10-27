@@ -5,7 +5,7 @@
   refresh tokens to hand to LMail.
 .DESCRIPTION
   Single file: copy it anywhere. It reads mailtest.config.yaml from its own directory and creates
-  that file from an embedded template when it is missing (then stops without sending).
+  that file from an embedded template when it is missing, then carries on.
   SMTP uses .NET TcpClient + SslStream with AUTH LOGIN / PLAIN / XOAUTH2.
   Two entries: send a test mail (default; uses default_profile or -Profile), or -InitOAuth to
   authorize an OAuth2 provider. With no arguments in a terminal a menu offers both. -InitOAuth lists
@@ -145,7 +145,7 @@ function Test-OAuthSettings {
     [void](Require-String $OAuth 'client_id' 'oauth2')
     $tenant = ''
     if ($provider -eq 'microsoft') {
-        $tenant = [string](Get-Setting $OAuth 'tenant' 'organizations')
+        $tenant = [string](Get-Setting $OAuth 'tenant' 'common')
         if ($tenant -notmatch '^[A-Za-z0-9.-]+$') { throw 'Invalid oauth2.tenant.' }
     }
     $flow = [string](Get-Setting $OAuth 'flow' 'loopback')
@@ -438,7 +438,7 @@ function Get-OAuthSettings {
     param([object]$OAuth, [ValidateSet('smtp','graph')][string]$Target)
     $provider = [string](Get-Setting $OAuth 'provider' 'microsoft')
     $grant = [string](Get-Setting $OAuth 'grant' 'refresh_token')
-    $tenant = [string](Get-Setting $OAuth 'tenant' 'organizations')
+    $tenant = [string](Get-Setting $OAuth 'tenant' 'common')
     $settings = @{
         Provider = $provider; Grant = $grant; Tenant = $tenant
         ClientId = Require-String $OAuth 'client_id' 'oauth2'
@@ -583,6 +583,15 @@ function Test-Interactive {
     return (-not [Console]::IsInputRedirected)
 }
 
+function Read-Value {
+    param([string]$Prompt, [switch]$Secret)
+    if (-not $Secret) { return (Read-Host $Prompt).Trim() }
+    $secure = Read-Host $Prompt -AsSecureString
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+}
+
 function Read-Choice {
     param([string]$Prompt, [int]$Count)
     $answer = (Read-Host $Prompt).Trim()
@@ -640,14 +649,32 @@ function Invoke-OAuthInit {
     param([object]$OAuth, [ValidateSet('smtp','graph')][string]$Target)
     $settings = Get-OAuthSettings -OAuth $OAuth -Target $Target
     if ($settings.ClientId -in @('00000000-0000-0000-0000-000000000000', 'example.apps.googleusercontent.com', 'your-client-id')) {
-        throw "oauth2.client_id of profile '$ProfileName' is still the template placeholder. Edit $absoluteConfig first."
+        if (-not (Test-Interactive)) {
+            throw "oauth2.client_id of profile '$ProfileName' is still the template placeholder. Edit $absoluteConfig first."
+        }
+        Write-Host "Profile '$ProfileName' still has the template client_id. Enter the values from your app registration"
+        Write-Host "(nothing is saved here; put them into $absoluteConfig to reuse them)."
+        $settings.ClientId = Read-Value 'client_id'
+        if ([string]::IsNullOrWhiteSpace($settings.ClientId)) { throw 'client_id is required.' }
+    }
+    if ($settings.Provider -eq 'generic' -and (Test-Interactive) -and $settings.AuthorizeUrl -match '\.example\.com') {
+        $settings.AuthorizeUrl = Read-Value 'authorize_url'
+        $settings.TokenUrl = Read-Value 'token_url'
+        $enteredScope = Read-Value "scope [$($settings.InitScope)]"
+        if (-not [string]::IsNullOrWhiteSpace($enteredScope)) { $settings.InitScope = $enteredScope }
+        if ($settings.AuthorizeUrl -notmatch '^https://' -or $settings.TokenUrl -notmatch '^https://') { throw 'authorize_url and token_url must be HTTPS URLs.' }
     }
     if ($settings.Provider -eq 'microsoft' -and $settings.Flow -eq 'device_code') {
         $result = Invoke-MicrosoftDeviceCode -Tenant $settings.Tenant -ClientId $settings.ClientId -Scope $settings.InitScope
     } else {
         $secret = ''
         if ($settings.Provider -eq 'google' -or -not [string]::IsNullOrWhiteSpace($settings.ClientSecret)) {
-            $secret = Resolve-Secret $settings.ClientSecret 'oauth2.client_secret'
+            $unset = $settings.ClientSecret -match '^env:([A-Za-z_][A-Za-z0-9_]*)$' -and [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Matches[1]))
+            if ((Test-Interactive) -and ([string]::IsNullOrWhiteSpace($settings.ClientSecret) -or $unset)) {
+                $secret = Read-Value 'client_secret (input hidden, empty for none)' -Secret
+            } else {
+                $secret = Resolve-Secret $settings.ClientSecret 'oauth2.client_secret'
+            }
         }
         $result = Invoke-AuthorizationCodeFlow -Settings $settings -ClientSecret $secret
     }
@@ -985,21 +1012,23 @@ function Send-GraphMail {
 $script:EmbeddedMailConfig = @'
 # Mail Send Test configuration, shared by mailtest.ps1 and mailtest.sh
 # -----------------------------------------------------------------------------
-# The first run of a script creates this file beside the script and stops (no mail is sent).
-# Edit message.* and the profile you want, save, and run again. See docs/MAILTEST.md.
+# This file is created next to the script on the first run. Edit message.* and the profile you
+# want, save, and run again. Details and links: docs/MAILTEST.md.
 #
+#   ./mailtest.sh                                 .\mailtest.ps1                 (menu)
 #   ./mailtest.sh --validate-only                 .\mailtest.ps1 -ValidateOnly
 #   ./mailtest.sh --profile smtp_ssl              .\mailtest.ps1 -Profile smtp_ssl
-#   ./mailtest.sh --profile gmail_oauth --init-oauth
-#                                                 .\mailtest.ps1 -Profile gmail_oauth -InitOAuth
+#   ./mailtest.sh --init-oauth                    .\mailtest.ps1 -InitOAuth      (get a token)
 #
-# --init-oauth / -InitOAuth signs a user in through a local web server on this machine, prints
+# Two entries: "send a test mail" uses a profile below; "authorize" (--init-oauth / -InitOAuth)
+# lists the OAuth profiles, signs a user in through a small web server on this machine, prints
 # the refresh token (give it to LMail, or export it as the env: variable the profile names) and
-# exits. It does not send mail.
+# exits. It does not send mail and never opens a browser: open the printed URL yourself.
 #
 # Secrets: write env:NAME instead of the value and export NAME in your shell. Never commit real
 # passwords, client secrets, API tokens or refresh tokens.
-# All host names, ids and addresses below are placeholders; replace them.
+# All host names, ids and addresses below are placeholders; replace them. In a terminal the
+# authorize entry asks for client_id / client_secret when the placeholder is still there.
 # Use spaces for indentation (no tabs). Only simple YAML is supported: maps, lists, comments, | text.
 # -----------------------------------------------------------------------------
 default_profile: smtp_starttls
@@ -1017,7 +1046,12 @@ message:
   # bcc: ["hidden@example.net"]
 
 profiles:
-  # Plain SMTP, port 587 + STARTTLS. Works for most mailboxes with an app password.
+  # ---------------------------------------------------------------------------
+  # Plain SMTP with a user name and password
+  # ---------------------------------------------------------------------------
+  # Port 587 + STARTTLS. Host, user and password come from your mail provider. Many providers
+  # (Gmail, Outlook.com, Yahoo, iCloud) require an app password instead of the account password:
+  # create it in the account's security settings (it usually needs 2-step verification).
   smtp_starttls:
     type: smtp
     host: "smtp.example.com"
@@ -1029,7 +1063,7 @@ profiles:
       username: "sender@example.com"
       password: "env:SMTP_PASSWORD"
 
-  # Plain SMTP, port 465 + implicit TLS.
+  # Port 465 with TLS from the first byte.
   smtp_ssl:
     type: smtp
     host: "smtp.example.com"
@@ -1049,10 +1083,36 @@ profiles:
     auth:
       mode: none
 
-  # Microsoft 365 SMTP for a signed-in user.
-  # Get the token once with --init-oauth, then export MS_SMTP_REFRESH_TOKEN. The Entra app needs
-  # the redirect URI http://localhost (platform "Mobile and desktop applications"). Without a
-  # browser on this machine add "flow: device_code" (needs "Allow public client flows").
+  # ---------------------------------------------------------------------------
+  # Microsoft: sign in as a user (refresh token)
+  # ---------------------------------------------------------------------------
+  # Register one app for both profiles below (Microsoft Entra admin center, entra.microsoft.com):
+  #   1. Entra ID > App registrations > New registration. Name it anything.
+  #   2. Supported account types:
+  #        common         "Accounts in any organizational directory and personal Microsoft accounts"
+  #                       (work, school AND personal accounts; the right choice for most people)
+  #        organizations  "Accounts in any organizational directory" (work or school accounts only)
+  #        consumers      personal accounts only (set the same account type as for common)
+  #        a tenant GUID or domain   "This organizational directory only" (one company)
+  #      Put the matching value into "tenant:" below.
+  #   3. Redirect URI (the callback): platform "Public client/native (mobile & desktop)",
+  #      value  http://localhost   (loopback addresses accept any port, so the tool's random port
+  #      works). It can also be added later under Authentication > Add a platform > Mobile and
+  #      desktop applications.
+  #   4. Copy "Application (client) ID" from the Overview page into "client_id:". No client secret
+  #      is needed for this public client.
+  #   5. API permissions > Add a permission: see each profile. Consent as your organisation requires.
+  #   6. Only for "flow: device_code" (a machine without a browser or localhost access):
+  #      Authentication > Allow public client flows = Yes; then redirect URI is not used.
+  # Then run the authorize entry, choose the profile, open the URL, sign in, and export the token.
+
+  # Microsoft 365 / Outlook.com SMTP for a signed-in user.
+  # Permission: API permissions > Microsoft APIs > Office 365 Exchange Online (under "APIs my
+  # organization uses" if not listed) > Delegated > SMTP.Send.
+  # Work or school mailbox: SMTP AUTH must be allowed for it (Exchange admin center > Mailboxes >
+  # Manage email apps > Authenticated SMTP). host smtp.office365.com.
+  # Personal Outlook.com / Hotmail mailbox: use host smtp-mail.outlook.com and tenant common.
+  # Token variable: export MS_SMTP_REFRESH_TOKEN
   microsoft_user:
     type: smtp
     host: "smtp.office365.com"
@@ -1064,12 +1124,54 @@ profiles:
       oauth2:
         provider: microsoft
         grant: refresh_token
-        tenant: "organizations"           # or your tenant GUID / domain
+        tenant: "common"                  # common | organizations | consumers | tenant GUID / domain
         client_id: "00000000-0000-0000-0000-000000000000"
         refresh_token: "env:MS_SMTP_REFRESH_TOKEN"
 
-  # Microsoft 365 SMTP, application identity (client credentials, no interactive sign-in).
-  # Needs SMTP.SendAsApp and Exchange service principal / mailbox permissions.
+  # Microsoft Graph sendMail (HTTPS, no SMTP port needed) for a signed-in user, work or personal.
+  # Permission: API permissions > Microsoft Graph > Delegated permissions > Mail.Send.
+  # Uses the same app registration as above or its own; the refresh token is separate from the
+  # SMTP one because the scope differs. Graph sends as the signed-in user.
+  # Token variable: export MS_GRAPH_REFRESH_TOKEN
+  microsoft_graph_user:
+    type: microsoft_graph
+    oauth2:
+      provider: microsoft
+      grant: refresh_token
+      tenant: "common"                    # common | organizations | consumers | tenant GUID / domain
+      client_id: "00000000-0000-0000-0000-000000000000"
+      refresh_token: "env:MS_GRAPH_REFRESH_TOKEN"
+
+  # ---------------------------------------------------------------------------
+  # Microsoft: application identity (client credentials, work or school tenant only)
+  # ---------------------------------------------------------------------------
+  # No user signs in, so there is no callback / redirect URI and no token to fetch: the tool
+  # exchanges client_id + client_secret for an access token on every run. Personal accounts are
+  # not supported. Setup in the Entra admin center:
+  #   1. App registrations > New registration, account type "This organizational directory only".
+  #      Leave the redirect URI empty.
+  #   2. Overview: copy "Application (client) ID" -> client_id, "Directory (tenant) ID" -> tenant.
+  #      The tenant must be that GUID or your domain, never common/organizations/consumers.
+  #   3. Certificates & secrets > New client secret: copy the secret VALUE (shown once), not its
+  #      ID, and export it:  export MS_CLIENT_SECRET=...
+  #   4. API permissions > Add a permission > Application permissions, then "Grant admin consent":
+  #      for Graph: Microsoft Graph > Mail.Send; for SMTP: Office 365 Exchange Online > SMTP.SendAsApp
+  #      plus an Exchange service principal and mailbox permission (see docs/MAILTEST.md).
+  #   5. Mail.Send application permission can send as ANY mailbox: limit it with an Exchange
+  #      Application Access Policy (New-ApplicationAccessPolicy) to the mailboxes you need.
+
+  # Microsoft Graph sendMail as the mailbox below. "mailbox" must equal message.from.
+  microsoft_graph_app:
+    type: microsoft_graph
+    mailbox: "sender@example.com"
+    oauth2:
+      provider: microsoft
+      grant: client_credentials
+      tenant: "11111111-1111-1111-1111-111111111111"
+      client_id: "22222222-2222-2222-2222-222222222222"
+      client_secret: "env:MS_CLIENT_SECRET"
+
+  # Microsoft 365 SMTP (smtp.office365.com) as the mailbox in "username".
   microsoft_app:
     type: smtp
     host: "smtp.office365.com"
@@ -1085,49 +1187,25 @@ profiles:
         client_id: "22222222-2222-2222-2222-222222222222"
         client_secret: "env:MS_CLIENT_SECRET"
 
-  # Cloudflare Email Sending over SMTP. The user name is the literal api_token; the password is an
-  # API token with Email Sending: Edit permission.
-  cloudflare_smtp:
-    type: smtp
-    host: "smtp.mx.cloudflare.net"
-    port: 465
-    security: ssl
-    auth:
-      mode: plain
-      username: "api_token"
-      password: "env:CF_API_TOKEN"
-
-  # Cloudflare Email Sending over HTTPS (port 443), for networks that block SMTP.
-  cloudflare_api:
-    type: cloudflare_api
-    account_id: "0123456789abcdef0123456789abcdef"
-    api_token: "env:CF_API_TOKEN"
-
-  # Microsoft Graph sendMail, application identity. Needs Graph Mail.Send (Application) + admin
-  # consent; mailbox must equal message.from.
-  microsoft_graph_app:
-    type: microsoft_graph
-    mailbox: "sender@example.com"
-    oauth2:
-      provider: microsoft
-      grant: client_credentials
-      tenant: "11111111-1111-1111-1111-111111111111"
-      client_id: "22222222-2222-2222-2222-222222222222"
-      client_secret: "env:MS_CLIENT_SECRET"
-
-  # Microsoft Graph sendMail for a signed-in user. Its refresh token is separate from the SMTP one
-  # because the scope differs.
-  microsoft_graph_user:
-    type: microsoft_graph
-    oauth2:
-      provider: microsoft
-      grant: refresh_token
-      tenant: "organizations"
-      client_id: "00000000-0000-0000-0000-000000000000"
-      refresh_token: "env:MS_GRAPH_REFRESH_TOKEN"
-
-  # Gmail SMTP with XOAUTH2. Create an OAuth client of type "Desktop app", fill in client_id and
-  # export GOOGLE_CLIENT_SECRET, run --init-oauth, then export GOOGLE_REFRESH_TOKEN.
+  # ---------------------------------------------------------------------------
+  # Google
+  # ---------------------------------------------------------------------------
+  # Gmail SMTP with XOAUTH2 (scope https://mail.google.com/). Setup in the Google Cloud console
+  # (console.cloud.google.com):
+  #   1. Create or select a project.
+  #   2. APIs & Services > OAuth consent screen (Google Auth Platform): choose "External" (or
+  #      "Internal" for a Google Workspace organisation) and fill the required fields. While the
+  #      app is in "Testing" status add your Google account under "Test users"; in Testing,
+  #      refresh tokens expire after 7 days. Publish the app for longer-lived tokens.
+  #   3. APIs & Services > Credentials > Create credentials > OAuth client ID, application type
+  #      "Desktop app". Copy "Client ID" -> client_id and "Client secret" ->
+  #      export GOOGLE_CLIENT_SECRET=...
+  #   4. Callback / redirect URI: nothing to register. A Desktop app client accepts
+  #      http://localhost and http://127.0.0.1 on any port. If you use a "Web application"
+  #      client instead, add  http://localhost:PORT  under "Authorized redirect URIs" and set
+  #      redirect_port: PORT below.
+  #   5. Run the authorize entry, choose gmail_oauth, open the URL, approve "Read, compose, send
+  #      and permanently delete all your email from Gmail", then export GOOGLE_REFRESH_TOKEN.
   gmail_oauth:
     type: smtp
     host: "smtp.gmail.com"
@@ -1141,11 +1219,22 @@ profiles:
         grant: refresh_token
         client_id: "example.apps.googleusercontent.com"
         client_secret: "env:GOOGLE_CLIENT_SECRET"
+        # redirect_port: 8765                 # only for a "Web application" client
         refresh_token: "env:GOOGLE_REFRESH_TOKEN"
 
-  # Any other OAuth2 provider that supports the authorization code flow (for example a Yahoo,
-  # Zoho or self-hosted identity server). Register http://localhost as redirect URI, or set
-  # redirect_port to the exact port the provider has registered.
+  # ---------------------------------------------------------------------------
+  # Any other OAuth2 provider (authorization code flow)
+  # ---------------------------------------------------------------------------
+  # Yahoo, Zoho, a self-hosted identity server, ... Take these from the provider's developer
+  # documentation / app console:
+  #   authorize_url, token_url   the OAuth2 authorization and token endpoints (HTTPS)
+  #   scope                      what lets you send mail; include the offline scope that yields a
+  #                              refresh token (often "offline_access")
+  #   client_id / client_secret  from the app you register there (omit the secret for a public
+  #                              client)
+  #   callback / redirect URI    register  http://localhost  ; if the provider needs the exact URI,
+  #                              register  http://localhost:8765  and set redirect_port: 8765
+  # The provider must support authorization code with PKCE and return a refresh token.
   generic_oauth:
     type: smtp
     host: "smtp.example.com"
@@ -1165,7 +1254,7 @@ profiles:
         # redirect_port: 8765
         refresh_token: "env:OAUTH_REFRESH_TOKEN"
 
-  # Any SMTP server with a short-lived access token you obtained elsewhere.
+  # Any SMTP server with a short-lived access token you obtained elsewhere (no refresh).
   generic_xoauth2:
     type: smtp
     host: "smtp.example.com"
@@ -1178,6 +1267,32 @@ profiles:
         provider: generic
         grant: access_token
         access_token: "env:SMTP_OAUTH_ACCESS_TOKEN"
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare Email Sending (no OAuth)
+  # ---------------------------------------------------------------------------
+  # Enable Email Sending for your account and verify the sender domain first
+  # (Cloudflare dashboard > Email > Email Sending). Create an API token: My Profile > API Tokens >
+  # Create Token > Custom token with permission  Account > Email Sending > Edit , then
+  #   export CF_API_TOKEN=...
+  # SMTP: the user name is the literal text api_token and the password is that token.
+  cloudflare_smtp:
+    type: smtp
+    host: "smtp.mx.cloudflare.net"
+    port: 465
+    security: ssl
+    auth:
+      mode: plain
+      username: "api_token"
+      password: "env:CF_API_TOKEN"
+
+  # HTTPS API (port 443), for networks that block SMTP. The 32-character account id is shown on
+  # the dashboard (Account home > the account's menu > Copy account ID, or in the URL
+  # dash.cloudflare.com/<account id>/...).
+  cloudflare_api:
+    type: cloudflare_api
+    account_id: "0123456789abcdef0123456789abcdef"
+    api_token: "env:CF_API_TOKEN"
 '@
 
 # Only the main script is required. A portable YAML subset parser is included below.
@@ -1416,10 +1531,7 @@ try {
     $absoluteConfig = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ConfigPath)
     if (-not [IO.File]::Exists($absoluteConfig)) {
         New-MailConfigFile -Path $absoluteConfig
-        Write-Host "[SETUP] Created example configuration: $absoluteConfig" -ForegroundColor Yellow
-        Write-Host '        Edit message.from / message.to and the selected SMTP/API profile, then run the script again.'
-        Write-Host '        No email was sent. (Exit code 2 = configuration created.)'
-        exit 2
+        Write-Host "[SETUP] Created $absoluteConfig from the built-in template (edit it to add your profiles)." -ForegroundColor Yellow
     }
     $yamlText = [IO.File]::ReadAllText($absoluteConfig, [Text.Encoding]::UTF8)
     $config = ConvertFrom-PortableYaml -Text $yamlText
@@ -1479,6 +1591,9 @@ try {
         Write-Host "[OK] YAML loaded; profile='$ProfileName'; type='$transport'; from='$($message.from)'; to=$($message.to.Count)."
         Write-Host '     Checked YAML, chosen profile and message fields. No secrets resolved; no network connection or authentication attempted.'
         exit 0
+    }
+    if ($message.from -eq 'sender@example.com' -and $message.to -contains 'recipient@example.net') {
+        throw "message.from and message.to still hold the template placeholders. Edit $absoluteConfig first."
     }
     Write-Host "Testing profile '$ProfileName' ($transport) -> $($message.to -join ', ')"
     switch ($transport) {
