@@ -1,0 +1,18 @@
+# Workspace-level generated data
+/temp/
+/dist/
+/plan/
+
+# Local secrets and machine state
+.env
+.env.*
+!.env.example
+*.user
+.vs/
+
+# Fallback ignores for generated build output
+**/bin/
+**/obj/
+**/TestResults/
+**/TestResults.xml
+**/*.trx

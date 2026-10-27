@@ -1,0 +1,58 @@
+name: Publish NuGet Package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      preview:
+        description: Publish a preview package.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuget-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Determine package version
+        env:
+          PREVIEW: ${{ inputs.preview }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: bash scripts/package-version.sh
+      - name: Build, verify and pack
+        run: bash scripts/publish.sh -p:Version="$PACKAGE_VERSION" -p:ContinuousIntegrationBuild=true
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages-${{ env.PACKAGE_VERSION }}
+          path: |
+            dist/packages/LMail.${{ env.PACKAGE_VERSION }}.nupkg
+            dist/packages/LMail.${{ env.PACKAGE_VERSION }}.snupkg
+          if-no-files-found: error
+      - name: Push to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [[ -z "$NUGET_API_KEY" ]]; then
+            echo "Set the NUGET_API_KEY repository secret before publishing." >&2
+            exit 1
+          fi
+          dotnet nuget push "dist/packages/LMail.${PACKAGE_VERSION}.nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
