@@ -4,6 +4,7 @@
 /plan/
 
 # Local secrets and machine state
+/scripts/mailtest/mailtest.config.yaml
 .env
 .env.*
 !.env.example

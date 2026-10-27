@@ -218,6 +218,12 @@ All senders validate the message before any network call.
 | Cloudflare attachments | 5 MiB total |
 | SES v2 raw message | 40 MB total after MIME encoding |
 
+## Test and token tools
+
+`scripts/mailtest/` has a bash and a PowerShell tool that read the same YAML, send one test message through
+SMTP, Graph or Cloudflare, and obtain OAuth2 refresh tokens for Microsoft 365 and Gmail. See
+[Mail test tools](docs/MAILTEST.md).
+
 ## Sample and verification
 
 ```bash
